@@ -48,7 +48,7 @@ class Single_Particle_Tracking():
         (from a normal distribution of mean = 0, scale = noise_level; noise is assumed to be of a normal distribution as stated in Chapter 4.2 of [1]) are created.
         Lastly, depending on a particle's charge, both are either added or subtracted from the particle's initial angle, thus obtaining a path in the detector.
 
-        Addition comment:
+        Additional comment:
         Currently I believe this function is sufficient enough to generate simplified circular paths. However, this shall not remain unmodified and should be revised soon.
         '''
 
