@@ -3,9 +3,16 @@ import matplotlib.pyplot as plt
 import sys
 from skimage.feature import peak_local_max
 import scipy.stats
-from scipy.ndimage import gaussian_filter
+from scipy.ndimage import gaussian_filter, center_of_mass
 import os
 from scipy.spatial import distance_matrix
+import keras
+from keras import layers
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+from keras.regularizers import l2
+import tensorflow as tf
+import zipfile
+from sklearn.model_selection import train_test_split
 
 N = 10 #Plot limiting variable
 minMom = 0.5 #min momentum fraction of max momentum
@@ -53,11 +60,11 @@ class particleTracker():
     def __init__(self, name="Particle ", par_num_detectors = None, par_max_momentum = None, par_phiMax = None, par_A = None):
 
         ### Particle Properties ###
-        self.name = str(name) # Name 
-        self.q = np.random.choice([-1,1]) # Charge 
+        self.name = str(name) # Name
+        self.q = np.random.choice([-1,1]) # Charge
         self.max_momentum = par_max_momentum
-        self.min_momentum = minMom * par_max_momentum 
-        self.p = np.random.uniform(self.min_momentum, self.max_momentum) # Momentum 
+        self.min_momentum = minMom * par_max_momentum
+        self.p = np.random.uniform(self.min_momentum, self.max_momentum) # Momentum
         self.A = par_A
         self.C = (self.q * self.A) / self.p # A = Curvature Consant (=3*10^-4 GeV mm^-1)
 
@@ -74,7 +81,7 @@ class particleTracker():
 
     def particle_path(self, noise = None):
         phis = self.phi0 + self.detector_pos * self.C + scipy.stats.norm.rvs(loc = 0, scale = noise)
-        
+
         x_vals = self.detector_pos * np.cos(phis)
         y_vals = self.detector_pos * np.sin(phis)
         mask = (x_vals >= 0) & (y_vals >= 0)
@@ -93,7 +100,7 @@ class particleTracker():
         self.hough_r = np.linspace(-self.A * N / self.min_momentum,
                                     self.A * N / self.min_momentum, hough_r_bins)
 
-        accumulator = np.zeros((len(self.hough_phi), len(self.hough_r)))
+        accumulator_clipped = np.zeros((len(self.hough_phi), len(self.hough_r)))
         hough_phi_dense = np.linspace(self.hough_phi[0], self.hough_phi[-1], 10 * len(self.hough_phi))
 
         r_min = self.hough_r[0]
@@ -112,7 +119,7 @@ class particleTracker():
 
         # Loop over all detected points (excluding origin)
         for x, y in self.detected_points[1:]:
-            denom_dense = 2 * (-x * cos_phi_dense + y * sin_phi_dense)
+            denom_dense = 2 * (-x * sin_phi_dense + y * cos_phi_dense)
             hough_r_dense = denom_dense / (x**2 + y**2)
 
             # Filter valid indices on dense grid
@@ -127,7 +134,7 @@ class particleTracker():
             # Convert to bin indices on original coarse grid (hough_phi, hough_r)
             i_phi = np.searchsorted(hough_phi, phi_valid, side='right') - 1
             i_r = np.searchsorted(hough_r, r_valid, side='right') - 1
-            
+
             # Remove any invalid indices
             valid_idx = (
                 (i_phi >= 0) & (i_phi < len(self.hough_phi)) &
@@ -137,11 +144,19 @@ class particleTracker():
             i_phi = i_phi[valid_idx]
             i_r   = i_r[valid_idx]
 
-            np.add.at(accumulator, (i_phi, i_r), 1)
+            # Unique pairs of (i_phi, i_r) -> prevent double-counting from dense sampling
+            unique_bin_indices = set(zip(i_phi, i_r))
+
+            # Create a temporary zero array and set 1s for unique bin hits
+            temp_acc = np.zeros_like(accumulator_clipped)
+            for phi_idx, r_idx in unique_bin_indices:
+               temp_acc[phi_idx, r_idx] = 1  # Only one vote per point per bin
+
+            accumulator_clipped += temp_acc
+
             self.hough_lines.append((phi_valid[valid_idx], r_valid[valid_idx]))
 
-        return accumulator
-
+        return accumulator_clipped
 
 class Simulation():
     def __init__(self, particle_num = None, max_momentum = None, num_detectors = None, measurement_error = None, phiMax = np.pi/2, A=None):
@@ -175,7 +190,7 @@ class Simulation():
                 #print("COMPLETED ", i, " PARTICLES")
                 Updater = Updater + 1
             err = np.random.uniform(-measurement_error, measurement_error)
-            
+
             particle = particleTracker(name = i, par_num_detectors = num_detectors, par_max_momentum = max_momentum, par_phiMax = phiMax, par_A = A)
             particle.particle_path(noise=err)
             self.particles.append(particle)
@@ -216,7 +231,7 @@ class Simulation():
             if i == 0:
                 self.accumulator = particle.hough_data(hough_phi_bins = phi_bins, hough_r_bins = r_bins)
                 self.hough_phi = particle.hough_phi
-                self.hough_r = particle.hough_r           
+                self.hough_r = particle.hough_r
             else:
                 self.accumulator += particle.hough_data(hough_phi_bins = phi_bins, hough_r_bins = r_bins)
 
@@ -235,10 +250,10 @@ class Simulation():
         plt.xlim(self.hough_phi[0], self.hough_phi[-1])
         plt.show()
 
-    def plot_hough_histogram(self, show_peaks=None, sigma = None, threshold_percentile = None, min_dist = None):
+    def plot_hough_histogram(self, show_peaks=None, sigma = None, threshold_percentile = None, min_dist = None, CNNpeaks = None):
 
         plt.figure(figsize=(14, 6))
-        plt.imshow(self.accumulator.T, extent=[(self.hough_phi[0]), (self.hough_phi[-1]), (self.hough_r[0]), (self.hough_r[-1]) ], 
+        plt.imshow(self.accumulator.T, extent=[(self.hough_phi[0]), (self.hough_phi[-1]), (self.hough_r[0]), (self.hough_r[-1]) ],
                     aspect='auto', origin='lower', cmap='hot')
         plt.xlabel('Ejection angle φ (radians)')
         plt.ylabel(r"Inverse Radius $\left(\frac{1}{r}\right)$")
@@ -246,10 +261,26 @@ class Simulation():
         plt.colorbar(label='Counts')
 
         if show_peaks:
-            peaks = self.find_hough_peaks(sigma=sigma, threshold_percentile=threshold_percentile, min_dist=min_dist)
-            phi_vals = peaks[:, 0]
-            r_vals = peaks[:, 1]
-            plt.scatter(phi_vals, r_vals, s=30, color='cyan', marker='o', label='Detected Peaks')
+            if CNNpeaks is not None and len(CNNpeaks) > 0:
+                cnn_phi = CNNpeaks[:, 0]
+                cnn_r = CNNpeaks[:, 1]
+                plt.scatter(cnn_phi, cnn_r, s=50, color='magenta', marker='x', label='CNN Peaks')
+            else:
+                peaks = self.find_hough_peaks(sigma=sigma, threshold_percentile=threshold_percentile, min_dist=min_dist)
+                phi_vals = peaks[:, 0]
+                r_vals   = peaks[:, 1]
+
+                # Check if detection_labels exist and match length
+                if self.detection_labels is not None and len(self.detection_labels) == len(peaks):
+                    for i in range(len(peaks)):
+                        color = 'lime' if self.detection_labels[i] == 1 else 'dodgerblue'
+                        label = 'Matched Peak' if self.detection_labels[i] == 1 else 'Unmatched Peak'
+                        plt.scatter(phi_vals[i], r_vals[i], s=30, color=color, marker='o', label=label if i == 0 or (self.detection_labels[:i] != self.detection_labels[i]).all() else "")
+
+                else:
+                    # Default behavior if no labels
+                    plt.scatter(phi_vals, r_vals, s=30, color='cyan', marker='o', label='Detected Peaks')
+
             plt.legend()
 
         plt.show()
@@ -261,36 +292,56 @@ class Simulation():
         coordinates = peak_local_max(
             smoothed,
             min_distance=min_dist,
-            threshold_abs=threshold,
+        threshold_abs=threshold,
         )
-        self.peak_coordinates = coordinates
 
-        for row, col in coordinates:
-            phi_val = self.hough_phi[row]
-            r_val   = self.hough_r[col]
-            self.peak_positions.append((phi_val, r_val))
-            #print(f"Peak: φ = {phi_val:.2f}, r = {r_val:.4f} (Radius = {1/r_val:.2f})")
+        window_size = 5
+        pad = window_size // 2
 
-        self.peak_positions.sort(key=lambda x: x[0])
+        refined_peaks = []
+        for y, x in coordinates:
+            if pad <= y < smoothed.shape[0] - pad and pad <= x < smoothed.shape[1] - pad:
+                window = smoothed[y-pad:y+pad+1, x-pad:x+pad+1]
+                dy, dx = center_of_mass(window)
+                refined_y = y - pad + dy
+                refined_x = x - pad + dx
+
+                # Convert to Hough space coordinates
+                phi_idx = int(round(refined_y))
+                r_idx = int(round(refined_x))
+
+                # Clamp to valid range
+                if 0 <= phi_idx < len(self.hough_phi) and 0 <= r_idx < len(self.hough_r):
+                    phi_val = self.hough_phi[phi_idx]
+                    r_val   = self.hough_r[r_idx]
+                    refined_peaks.append((refined_y, refined_x, phi_val, r_val))
+
+        # Sort by phi value
+        refined_peaks.sort(key=lambda x: x[2])
+
+        self.peak_coordinates = np.array([(y, x) for y, x, phi, r in refined_peaks])
+        self.peak_positions = [(phi, r) for y, x, phi, r in refined_peaks]
+
         return np.array(self.peak_positions)
-    
+
     def ErrorVerification(self):
-        
+
         # Get true values
         true_phi, true_qAp = zip(*self.initialPaths)
         true_phi = np.array(true_phi)
         true_qAp = np.array(true_qAp)
 
         #print("I should be seeing on my plot points with values: ", true_phi, " and ", true_qAp)
-        
+
         #for i in range(len(true_phi)):
         #    print(f" --- TRUE PEAKS {i}: φ = {true_phi[i]:.4f}, qA/p = {true_qAp[i]:.4f}")
 
 
         # Get detected peak positions
-        
+
         detected_peaks = np.array(self.peak_positions)
-        peak_phi = np.pi/2-detected_peaks[:, 0]
+        #peak_phi = np.pi/2-detected_peaks[:, 0]
+        peak_phi = detected_peaks[:, 0]
         peak_qAp = detected_peaks[:, 1]
 
         # Plot for visual verification
@@ -311,7 +362,7 @@ class Simulation():
         plt.grid(True)
         plt.show()
 
-    def falsePeakDetector(self, phi_threshold=None, qAp_threshold=None):
+    def falsePeakDetector(self, phi_threshold=None, qAp_threshold=None, printRes = None):
         # Get true values
         true_phi, true_qAp = zip(*self.initialPaths)
         true_phi = np.array(true_phi)
@@ -320,7 +371,7 @@ class Simulation():
 
         # Get detected peak positions
         detected_peaks = np.array(self.peak_positions)
-        detected_peaks[:, 0] = np.pi/2 - detected_peaks[:, 0]
+        #detected_peaks[:, 0] = np.pi/2 - detected_peaks[:, 0]
 
         # To store best matches as (true_idx, detected_idx, distance)
         best_matches = []
@@ -359,10 +410,10 @@ class Simulation():
         true_positives = len(final_detected_matched)
         false_positives = len(detected_peaks) - true_positives
         false_negatives = len(true_peaks) - len(final_true_matched)
-
-        print(f"✅ Matched Peaks: {true_positives}")
-        print(f"❌ Falsely Detected Peaks: {false_positives}")
-        print(f"❌ Missed True Peaks: {false_negatives}")
+        if printRes == True:
+          print(f"✅ Matched Peaks: {true_positives}")
+          print(f"❌ Falsely Detected Peaks: {false_positives}")
+          print(f"❌ Missed True Peaks: {false_negatives}")
 
         # Label detected peaks
         labels = np.zeros(len(detected_peaks), dtype=int)
@@ -370,9 +421,10 @@ class Simulation():
             labels[i] = 1
 
         self.detection_labels = labels
+        #np.save(r"C:\Users\Marce\Hough-Transform-for-Particle-Tracking\Marcel_Latwinski\detection_labels.npy", self.detection_labels)
 
-        
-    def getPeakImages(self, size = 64, save_dir="Marcel_Latwinski/PeakImages", verbose = False):
+
+    def getPeakImages(self, size = 64, save_dir="Marcel_Latwinski/PeakImages", zip_name="PeakImages.zip", verbose = False, save=None):
         if not hasattr(self, 'peak_coordinates') or len(self.peak_coordinates) == 0:
             print("No peak coordinates found. Run `find_hough_peaks()` first.")
             return
@@ -386,7 +438,7 @@ class Simulation():
                     print(f"Warning: Couldn't delete {file_path}: {e}")
         else:
             os.makedirs(save_dir)
-        
+
         for idx, (phi_i, r_i) in enumerate(self.peak_coordinates):
             # Treat phi_i as the row index (y), r_i as the column index (x)
             phi_i = int(phi_i)
@@ -395,9 +447,9 @@ class Simulation():
             patch = getImage(self.accumulator, size=size, x_center=r_i, y_center=phi_i)
 
             self.peak_patches.append(patch)
-
-            #npy_path = os.path.join(save_dir, f"peak_{idx}.npy")
-            #np.save(npy_path, patch)
+            if save==True:
+                npy_path = os.path.join(save_dir, f"peak_{idx}.npy")
+                np.save(npy_path, patch)
 
             #jpeg_path = os.path.join(save_dir, f"peak_{idx}.png")
             #save_patch_high_res(patch, jpeg_path, cmap='hot')
@@ -405,4 +457,11 @@ class Simulation():
             if verbose:
                 print(f"Saved peak {idx} at (row={phi_i}, col={r_i}) to {npy_path}") # and {jpeg_path}")
 
-        return self.peak_patches
+                # Zip the folder
+                zip_path = os.path.join(save_dir, "..", zip_name)  # Save zip one level above the folder
+                with zipfile.ZipFile(zip_path, 'w') as zipf:
+                    for filename in os.listdir(save_dir):
+                        file_path = os.path.join(save_dir, filename)
+                        zipf.write(file_path, arcname=filename)  # arcname keeps filenames clean in the zip
+                if verbose:
+                    print(f"\n✅ All peak images saved and zipped to: {zip_path}")
