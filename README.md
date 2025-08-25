@@ -19,7 +19,7 @@ This project implements a **hybrid particle tracking algorithm** combining the *
 ## Usage
 
 ```python
-from MLTrackingFunctions import Simulation
+from Marcel_Latwinski.MLTrackingFunctions import Simulation
 
 sim = Simulation(particle_num=10, max_momentum=5, num_detectors=50, measurement_error=0.01, phiMax=np.pi/2, A=3e-4)
 sim.plot_all_paths()
